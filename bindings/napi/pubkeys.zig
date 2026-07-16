@@ -22,13 +22,17 @@ const growth_step: u32 = preset.MAX_PENDING_DEPOSITS_PER_EPOCH * ((90 * 24 * 60 
 const State = struct {
     pubkey2index: PubkeyIndexMap = undefined,
     index2pubkey: Index2PubkeyCache = undefined,
+    populated: std.DynamicBitSetUnmanaged = .{},
     initialized: bool = false,
 
     pub fn init(self: *State) !void {
         if (self.initialized) return;
         self.pubkey2index = PubkeyIndexMap.init(allocator);
         try self.pubkey2index.ensureTotalCapacity(default_initial_capacity);
+        errdefer self.pubkey2index.deinit();
         self.index2pubkey = try Index2PubkeyCache.initCapacity(allocator, default_initial_capacity);
+        errdefer self.index2pubkey.deinit(allocator);
+        self.populated = try std.DynamicBitSetUnmanaged.initEmpty(allocator, default_initial_capacity);
         self.initialized = true;
     }
 
@@ -36,6 +40,7 @@ const State = struct {
         if (!self.initialized) return;
         self.pubkey2index.deinit();
         self.index2pubkey.deinit(allocator);
+        self.populated.deinit(allocator);
         self.initialized = false;
     }
 
@@ -44,6 +49,7 @@ const State = struct {
 
         self.pubkey2index.clearRetainingCapacity();
         self.index2pubkey.shrinkRetainingCapacity(0);
+        self.populated.unsetAll();
     }
 };
 
@@ -85,6 +91,12 @@ fn pubkey2indexWrittenSize() usize {
 
 /// JS: pubkeys.save(filePath)
 pub fn save(file_path: js.String) !void {
+    const len = state.index2pubkey.items.len;
+    std.debug.assert(len <= state.populated.bit_length);
+    for (0..len) |i| {
+        if (!state.populated.isSet(i)) return error.SparsePubkeyCache;
+    }
+
     var file_path_buf: [1024]u8 = undefined;
     const path = try file_path.toSlice(&file_path_buf);
     const io = napi_io.get();
@@ -144,6 +156,9 @@ pub fn load(file_path: js.String) !void {
     state.index2pubkey = try Index2PubkeyCache.initCapacity(allocator, saved_capacity);
     errdefer state.index2pubkey.deinit(allocator);
     try state.index2pubkey.resize(allocator, len);
+    state.populated = try std.DynamicBitSetUnmanaged.initEmpty(allocator, saved_capacity);
+    errdefer state.populated.deinit(allocator);
+    state.populated.setRangeValue(.{ .start = 0, .end = len }, true);
 
     const p2i_size = pubkey2indexWrittenSize();
     const i2p_size = @sizeOf(bls.PublicKey) * len;
@@ -187,9 +202,11 @@ pub fn getIndex(pubkey: js.Uint8Array) !js.Value {
 /// JS: pubkeys.get(index) → PublicKey | undefined
 pub fn get(index: js.Number) !?blst_bindings.PublicKey {
     if (!state.initialized) return error.PubkeyIndexNotInitialized;
+    std.debug.assert(state.index2pubkey.items.len <= state.populated.bit_length);
 
     const idx = try index.toU32();
     if (idx >= state.index2pubkey.items.len) return null;
+    if (!state.populated.isSet(@intCast(idx))) return error.PubkeyCacheHole;
 
     return .{ .raw = state.index2pubkey.items[@intCast(idx)] };
 }
@@ -203,6 +220,7 @@ pub fn get(index: js.Number) !?blst_bindings.PublicKey {
 /// JS: pubkeys.aggregate(indices) → PublicKey
 pub fn aggregate(indices: js.Array) !blst_bindings.PublicKey {
     if (!state.initialized) return error.PubkeyIndexNotInitialized;
+    std.debug.assert(state.index2pubkey.items.len <= state.populated.bit_length);
 
     const len = try indices.length();
     if (len == 0) return error.EmptyPublicKeyArray;
@@ -210,6 +228,7 @@ pub fn aggregate(indices: js.Array) !blst_bindings.PublicKey {
     if (len == 1) {
         const idx = try (try indices.getNumber(0)).toU32();
         if (idx >= state.index2pubkey.items.len) return error.PubkeyIndexNotFound;
+        if (!state.populated.isSet(@intCast(idx))) return error.PubkeyCacheHole;
         return .{ .raw = state.index2pubkey.items[@intCast(idx)] };
     }
 
@@ -225,6 +244,7 @@ pub fn aggregate(indices: js.Array) !blst_bindings.PublicKey {
     for (0..len) |i| {
         const idx = try (try indices.getNumber(@intCast(i))).toU32();
         if (idx >= state.index2pubkey.items.len) return error.PubkeyIndexNotFound;
+        if (!state.populated.isSet(@intCast(idx))) return error.PubkeyCacheHole;
         pks[i] = state.index2pubkey.items[@intCast(idx)];
     }
 
@@ -255,6 +275,7 @@ pub fn set(index: js.Number, pubkey: js.Uint8Array) !void {
         const new_cap: u32 = @intCast(@max(idx + 1, state.index2pubkey.capacity + growth_step));
         try state.pubkey2index.ensureTotalCapacity(new_cap);
         try state.index2pubkey.ensureTotalCapacityPrecise(allocator, new_cap);
+        try state.populated.resize(allocator, new_cap, false);
     }
 
     // Extend length if needed
@@ -267,6 +288,7 @@ pub fn set(index: js.Number, pubkey: js.Uint8Array) !void {
 
     // Deserialize and set index2pubkey
     state.index2pubkey.items[@intCast(idx)] = try bls.PublicKey.uncompress(pubkey_bytes);
+    state.populated.set(@intCast(idx));
 }
 
 /// JS: pubkeys.size() → number
@@ -289,6 +311,7 @@ pub fn ensureCapacity(new_size: js.Number) !void {
     // slightly more validators than reserved, which the zig-side syncPubkeys cannot
     // grow safely (it does not own the backing allocator)
     try state.index2pubkey.ensureTotalCapacity(allocator, requested);
+    try state.populated.resize(allocator, requested, false);
 }
 
 /// JS: pubkeys.capacity() → number

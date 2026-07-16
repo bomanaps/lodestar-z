@@ -103,6 +103,43 @@ describe("pubkeys", () => {
     expect(pubkeyCache.getIndex(keypairs[0].pubkeyBytes)).toBeNull();
   });
 
+  it("get throws for a hole below items.len", () => {
+    pubkeyCache.reset();
+    pubkeyCache.set(10, keypairs[0].pubkeyBytes);
+    expect(() => pubkeyCache.get(5)).toThrow();
+  });
+
+  it("aggregate throws when any input index is a hole", () => {
+    pubkeyCache.reset();
+    pubkeyCache.set(10, keypairs[0].pubkeyBytes);
+    expect(() => pubkeyCache.aggregate([5, 10])).toThrow();
+  });
+
+  it("dense set does not regress get and aggregate", () => {
+    pubkeyCache.reset();
+    for (const {index, pubkeyBytes} of keypairs) {
+      pubkeyCache.set(index, pubkeyBytes);
+    }
+    for (const {index} of keypairs) {
+      expect(pubkeyCache.get(index)).toBeDefined();
+    }
+    const indices = keypairs.map((k) => k.index);
+    const expected = aggregatePublicKeys(indices.map((i) => pubkeyCache.getOrThrow(i)));
+    expect(pubkeyCache.aggregate(indices).toBytes()).toEqual(expected.toBytes());
+  });
+
+  it("save rejects a sparse cache and accepts a dense one", () => {
+    pubkeyCache.reset();
+    pubkeyCache.set(10, keypairs[0].pubkeyBytes);
+    expect(() => pubkeyCache.save(tempPkixPath)).toThrow();
+
+    pubkeyCache.reset();
+    for (const {index, pubkeyBytes} of keypairs) {
+      pubkeyCache.set(index, pubkeyBytes);
+    }
+    expect(() => pubkeyCache.save(tempPkixPath)).not.toThrow();
+  });
+
   it("exposes native capacity", () => {
     expect(pubkeyCache.capacity).toBeGreaterThanOrEqual(1_000);
   });
